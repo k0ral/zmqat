@@ -13,7 +13,9 @@ main :: IO ()
 main = withContext 1 $ \context -> do  
     args <- getArgs
     case args of
-        ["-h"] -> quickHelp
+        ["-h"]      -> quickHelp
+        ["--help"]  -> quickHelp
+
 
         ["-req", socketName, message] ->  
             withSocket context Req $ \socket -> do
