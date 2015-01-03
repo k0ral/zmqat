@@ -1,98 +1,103 @@
 module Main where
 
-import Control.Applicative
-import Control.Monad (forever, when)
-import Data.Function (fix)
-import System.Environment
-import System.ZMQ
-import Data.ByteString.Char8 (pack, unpack)
-import Data.ByteString.UTF8 (fromString)
+-- {{{ Imports
+import           Options             hiding (Pattern (..))
+import qualified Options             (Pattern (..))
 
+import           ClassyPrelude
+
+import           Data.List.NonEmpty  hiding (map)
+
+import           System.IO           (BufferMode (..), hSetBuffering)
+import           System.ZMQ4.Monadic as ZMQ hiding (identity, message)
+-- }}}
 
 main :: IO ()
-main = withContext 1 $ \context -> do  
-    args <- getArgs
-    case args of
-        ["-h"]      -> quickHelp
-        ["--help"]  -> quickHelp
+main = do
+    Input pattern identity <- parseOptions
+    hSetBuffering stdout NoBuffering
+
+    case pattern of
+      Options.Req a -> requester a identity
+      Options.Rep a -> responser a identity
+      Options.Dealer a -> dealer a identity
+      Options.Router a -> router a identity
+      Options.Pub a -> publisher a identity
+      Options.Sub a b -> subscriber a identity b
+      Options.Push a -> pusher a identity
+      Options.Pull a -> puller a identity
 
 
-        ["-req", socketName, message] ->  
-            withSocket context Req $ \socket -> do
-                connect socket socketName
-                send socket (pack message) []                
-                reply <- receive socket []
-                putStrLn $ unpack reply
+requester :: Text -> Text -> IO ()
+requester socketName identity = runZMQ $ do
+  reqSocket <- socket Req
+  setIdentity (restrict $ encodeUtf8 identity) reqSocket
+  connect reqSocket $ unpack socketName
+  forever $ do
+    putStr "> "
+    send reqSocket [] . encodeUtf8 =<< getLine
+    putStrLn . ("< " ++) . decodeUtf8 =<< receive reqSocket
 
-        ["-reqi", socketName] ->
-            withSocket context Req $ \socket -> do
-                connect socket socketName
-                forever $ do
-                    line <- fromString <$> getLine
-                    send socket line []
-                    reply <- receive socket []
-                    putStrLn $ unpack reply
+responser :: Text -> Text -> IO ()
+responser socketName identity = runZMQ $ do
+  repSocket <- socket Rep
+  setIdentity (restrict $ encodeUtf8 identity) repSocket
+  bind repSocket $ unpack socketName
+  forever $ do
+    putStrLn . ("< " ++) . decodeUtf8 =<< receive repSocket
+    putStr "> "
+    send repSocket [] . encodeUtf8 =<< getLine
 
-        ["-rep", socketName, defaultResponse] -> 
-            withSocket context Rep $ \socket -> do
-                bind socket socketName 
-                forever $ do
-                    message <- receive socket []
-                    putStrLn $ unpack message
-                    send socket (pack defaultResponse) []
+router :: Text -> Text -> IO ()
+router socketName identity = runZMQ $ do
+  routerSocket <- socket Router
+  setIdentity (restrict $ encodeUtf8 identity) routerSocket
+  bind routerSocket $ unpack socketName
+  forever $ do
+    input <- receiveMulti routerSocket
+    case input of
+      identity : "" : request : [] -> do
+        putStrLn . ("< " ++) $ decodeUtf8 request
+        putStr "> "
+        response <- encodeUtf8 <$> getLine
+        sendMulti routerSocket $ identity :| "" : response : []
+      _ -> putStrLn "Received invalid frames."
 
-        ["-rbrok", frontendSocket, backendSocket] -> 
-            withSocket context Xrep $ \frontend -> 
-                withSocket context Xreq $ \backend -> do
-                    bind frontend frontendSocket
-                    bind backend  backendSocket 
-                    device Queue frontend backend
+dealer :: Text -> Text -> IO ()
+dealer socketName identity = runZMQ $ do
+  dealerSocket <- socket Dealer
+  setIdentity (restrict $ encodeUtf8 identity) dealerSocket
+  bind dealerSocket $ unpack socketName
+  forever $ putStrLn . decodeUtf8 =<< receive dealerSocket
 
-        ["-sub", socketName, filter] ->
-            withSocket context Sub $ \socket -> do
-                connect socket socketName
-                subscribe socket filter
-                forever $ do
-                    message <- receive socket []
-                    putStrLn $ unpack message
+publisher :: Text -> Text -> IO ()
+publisher socketName identity = runZMQ $ do
+  pubSocket <- socket Pub
+  setIdentity (restrict $ encodeUtf8 identity) pubSocket
+  connect pubSocket $ unpack socketName
+  forever $ putStr "> " >> getLine >>= send pubSocket [] . encodeUtf8
 
-        ["-pub", socketName] -> 
-            withSocket context Pub $ \socket -> do
-                bind socket socketName
-                forever $ do
-                    line <- fromString <$> getLine
-                    send socket line []
+subscriber :: Text -> Text -> [Text] -> IO ()
+subscriber socketName identity subscriptions = runZMQ $ do
+  subSocket <- socket Sub
+  setIdentity (restrict $ encodeUtf8 identity) subSocket
+  bind subSocket $ unpack socketName
+  forM subscriptions $ subscribe subSocket . encodeUtf8
+  forever $ receive subSocket >>= putStrLn . ("< " ++) . decodeUtf8
 
-        ["-proxy", frontendSocket, backendSocket, filter] -> 
-            withSocket context Sub $ \frontend -> 
-                withSocket context Pub $ \backend -> do
-                    connect frontend frontendSocket
-                    subscribe frontend filter 
-                    bind backend backendSocket
-                    forever $ proxy frontend backend
-                
-        _ -> do
-            putStrLn "Wrong arguments given."
-            quickHelp
-            
-            
-            return ()
+pusher :: Text -> Text -> IO ()
+pusher socketName identity = runZMQ $ do
+  pushSocket <- socket Push
+  setIdentity (restrict $ encodeUtf8 identity) pushSocket
+  connect pushSocket $ unpack socketName
+  forever $ putStr "> " >> getLine >>= send pushSocket [] . encodeUtf8
 
-quickHelp :: IO ()
-quickHelp = do
-    putStrLn "Usage: zmqat [-req|-reqi-rep|-rbrok|-sub--pub|-proxy] [OPTIONS]"
-    putStrLn ""
-    putStrLn "\"-req SOCKET_URI MESSAGE\" : send a single MESSAGE to the given responder SOCKET_URI."
-    putStrLn "\"-reqi SOCKET_URI\" : connect to responder SOCKET_URI and prompt interactively the user for messages to send."
-    putStrLn "\"-rep SOCKET_URI DEFAULT_RESPONSE\" : listen to requests at SOCKET_URI and send DEFAULT_RESPONSE to requesters."
-    putStrLn "\"-rbrok FRONTEND_SOCKET_URI BACKEND_SOCKET_URI\" : forward all requests received from FRONTEND_SOCKET_URI to BACKEND_SOCKET_URI. Doesn't seem to work for now."
-    putStrLn "\"-sub SOCKET_URI FILTER\" : connect to a publisher SOCKET_URI and print every published message that matches the FILTER."
-    putStrLn "\"-pub SOCKET_URI\" : prompt interactively the user for messages to publish at socket SOCKET_URI"
-    putStrLn "\"-proxy FRONTEND_SOCKET_URI BACKEND_SOCKET_URI FILTER\" : forward all published messages from BACKEND_SOCKET_URI to FRONTEND_SOCKET_URI while filtering them with FILTER."
+puller :: Text -> Text -> IO ()
+puller socketName identity = runZMQ $ do
+  pullSocket <- socket Pull
+  setIdentity (restrict $ encodeUtf8 identity) pullSocket
+  bind pullSocket $ unpack socketName
+  forever $ putStrLn . ("< " ++) . decodeUtf8 =<< receive pullSocket
 
-
-proxy from to = fix $ \loop -> do
-    message <- receive from []
-    more <- moreToReceive from 
-    send to message [SndMore | more]
-    when more loop
+io :: (MonadIO m) => IO a -> m a
+io = liftIO
